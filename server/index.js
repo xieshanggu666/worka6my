@@ -1,7 +1,7 @@
 import express from 'express'
-import { db } from './db.js'
+import { db, parseTimeMs as parseFeedMs } from './db.js'
 import {
-  now, statsSummary, validateItem, ingestPost
+  now, statsSummary, validateItem, ingestPost, addTimeline, openEventCount
 } from './pipeline.js'
 import {
   JOB_MAX, createJob, getJob, listJobs, resumeJob, pauseJob, recoverInterrupted
@@ -20,17 +20,40 @@ if (recovered) console.log(`[PUBMON] 恢复 ${recovered} 个中断的批量导�
 
 // 危机列表（含来源规则、承接规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
-  const list = q(`SELECT c.*, a.title alert_title,
-    (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events
+  const list = q(`SELECT c.*, a.title alert_title
     FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`)
   return list.map((c) => {
     const rules = q(`SELECT ca.alert_id, ca.is_origin, ca.first_at, ca.last_at, al.title alert_title, al.level alert_level
       FROM crisis_alerts ca LEFT JOIN alerts al ON al.id=ca.alert_id
       WHERE ca.crisis_id=? ORDER BY ca.is_origin DESC, ca.alert_id`, c.id)
-    const item = { ...c, rules }
+    // 未解除计数统一口径：与解除/结案/回滚链路共用 openEventCount
+    const item = { ...c, rules, open_events: openEventCount(c.id) }
     if (withTimeline) item.timeline = q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id DESC', c.id)
     return item
   })
+}
+
+// 统一总览统计：预警/解除/危机/结案口径与各列表、回溯页一致（全部基于落库实时计算）
+export function monitorOverview() {
+  const rules = q1("SELECT COUNT(*) c FROM alerts WHERE active=1").c
+  const ruleTotal = q1('SELECT COUNT(*) c FROM alerts').c
+  const openEvents = q1("SELECT COUNT(*) c FROM alert_events WHERE status='open'").c
+  const resolvedEvents = q1("SELECT COUNT(*) c FROM alert_events WHERE status='resolved'").c
+  const closeResolved = q1("SELECT COUNT(*) c FROM alert_events WHERE status='resolved' AND resolve_source='close'").c
+  const crisesTotal = q1('SELECT COUNT(*) c FROM crisis').c
+  const byStatus = {
+    monitoring: q1("SELECT COUNT(*) c FROM crisis WHERE status='monitoring'").c,
+    disposal: q1("SELECT COUNT(*) c FROM crisis WHERE status='disposal'").c,
+    closed: q1("SELECT COUNT(*) c FROM crisis WHERE status='closed'").c
+  }
+  const autoCrises = q1("SELECT COUNT(*) c FROM crisis WHERE origin='auto'").c
+  const multiRule = q1('SELECT COUNT(*) c FROM (SELECT crisis_id FROM crisis_alerts GROUP BY crisis_id HAVING COUNT(*)>1)').c
+  return {
+    rules, ruleTotal,
+    alertEvents: openEvents + resolvedEvents,
+    openEvents, resolvedEvents, closeResolved,
+    crisesTotal, crisesByStatus: byStatus, autoCrises, multiRule
+  }
 }
 
 // ===== 总览 =====
@@ -53,6 +76,7 @@ app.get('/api/state', (req, res) => {
   res.json({
     sources, hotWords: hot, activeAlerts, crises,
     stats: statsSummary(posts),
+    overview: monitorOverview(),
     trend
   })
 })
@@ -202,6 +226,26 @@ app.post('/api/alerts', (req, res) => {
     title, level, keyword || '', sentiment || '', heat_min || 0, now(), (merge_topic || '').trim(), Math.max(0, +merge_window || 0))
   res.json({ ok: true })
 })
+// 编辑规则（时间窗口/归并话题变更即时生效：后续触发按新配置判定，历史触发与时间线原样保留）
+app.patch('/api/alerts/:id', (req, res) => {
+  const al = q1('SELECT * FROM alerts WHERE id=?', req.params.id)
+  if (!al) return res.status(404).json({ error: 'not found' })
+  const b = req.body || {}
+  const fields = []
+  const vals = []
+  if (typeof b.title === 'string' && b.title.trim()) { fields.push('title=?'); vals.push(b.title.trim()) }
+  if (['red', 'orange', 'yellow'].includes(b.level)) { fields.push('level=?'); vals.push(b.level) }
+  if (typeof b.keyword === 'string') { fields.push('keyword=?'); vals.push(b.keyword.trim()) }
+  if (typeof b.sentiment === 'string') { fields.push('sentiment=?'); vals.push(b.sentiment.trim()) }
+  if (b.heat_min != null && b.heat_min !== '') { fields.push('heat_min=?'); vals.push(Math.max(0, +b.heat_min || 0)) }
+  let newTopic, newWindow
+  if (typeof b.merge_topic === 'string') { newTopic = b.merge_topic.trim(); fields.push('merge_topic=?'); vals.push(newTopic) }
+  if (b.merge_window != null && b.merge_window !== '') { newWindow = Math.max(0, +b.merge_window || 0); fields.push('merge_window=?'); vals.push(newWindow) }
+  if (!fields.length) return res.json({ ok: true, changed: [] })
+  vals.push(al.id)
+  run(`UPDATE alerts SET ${fields.join(',')} WHERE id=?`, ...vals)
+  res.json({ ok: true, changed: fields.map((f) => f.replace('=?', '')) })
+})
 app.post('/api/alerts/:id/toggle', (req, res) => {
   const al = q1('SELECT * FROM alerts WHERE id=?', req.params.id)
   if (!al) return res.status(404).json({ error: 'not found' })
@@ -215,47 +259,73 @@ app.delete('/api/alerts/:id', (req, res) => {
   res.json({ ok: true })
 })
 
-// 解除单条触发记录：同步危机时间线，返回该危机剩余未解除数
+// 单条预警解除/撤销解除：幂等（重复解除不重复写时间线），时间线行 ref 关联 alert_event，
+// 撤销时精确失效该时间线行（行保留，标记 voided）。
 app.post('/api/alert-events/:id/resolve', (req, res) => {
   const ev = q1('SELECT * FROM alert_events WHERE id=?', req.params.id)
   if (!ev) return res.status(404).json({ error: 'not found' })
-  if (ev.status === 'resolved') return res.json({ ok: true, already: true, crisisId: ev.crisis_id })
+  const undo = req.body && req.body.undo === true
+  const ts = now()
+
+  if (undo) {
+    if (ev.status === 'open') return res.json({ ok: true, already: true, status: 'open', crisisId: ev.crisis_id, openLeft: openEventCount(ev.crisis_id) })
+    // 结案级联解除的预警不允许单独撤销（须回滚结案），保证结案状态一致
+    if (ev.resolve_source === 'close') {
+      return res.status(409).json({ error: '该预警随结案级联解除，请先回滚结案' })
+    }
+    const c = ev.crisis_id ? q1('SELECT * FROM crisis WHERE id=?', ev.crisis_id) : null
+    if (c && c.status === 'closed') return res.status(409).json({ error: '事件已结案，请先回滚结案' })
+    run("UPDATE alert_events SET status='open', resolved=NULL, resolve_source='manual' WHERE id=?", ev.id)
+    if (ev.crisis_id) {
+      run("UPDATE crisis_timeline SET voided=1 WHERE ref_type='alert_event' AND ref_id=? AND kind='resolve' AND voided=0", ev.id)
+      addTimeline(ev.crisis_id, '解除撤销', `撤销预警 #${ev.id} 的解除，预警重新生效`, { kind: 'resolve', refType: 'alert_event', refId: ev.id, timeStr: ts })
+      run('UPDATE crisis SET updated=? WHERE id=?', ts, ev.crisis_id)
+    }
+    return res.json({ ok: true, status: 'open', crisisId: ev.crisis_id, openLeft: openEventCount(ev.crisis_id) })
+  }
+
+  if (ev.status === 'resolved') {
+    // 重复解除：幂等返回，不重复写时间线
+    return res.json({ ok: true, already: true, status: 'resolved', crisisId: ev.crisis_id, openLeft: openEventCount(ev.crisis_id) })
+  }
   const note = (req.body.note || '').trim() || '风险指标回落，预警解除'
-  run("UPDATE alert_events SET status='resolved', resolved=? WHERE id=?", now(), ev.id)
-  let openLeft = 0
+  run("UPDATE alert_events SET status='resolved', resolved=?, resolve_source='manual' WHERE id=?", ts, ev.id)
+  let timelineId = null
   if (ev.crisis_id) {
     const c = q1('SELECT * FROM crisis WHERE id=?', ev.crisis_id)
     if (c && c.status !== 'closed') {
       const al = q1('SELECT title FROM alerts WHERE id=?', ev.alert_id)
       const noteFull = al ? `规则「${al.title}」：${note}` : note
-      run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', c.id, '预警解除', noteFull, now())
-      run('UPDATE crisis SET updated=? WHERE id=?', now(), c.id)
+      timelineId = addTimeline(c.id, '预警解除', noteFull, { kind: 'resolve', refType: 'alert_event', refId: ev.id, timeStr: ts })
+      run('UPDATE crisis SET updated=? WHERE id=?', ts, c.id)
     }
-    openLeft = q1("SELECT COUNT(*) c FROM alert_events WHERE crisis_id=? AND status='open'", ev.crisis_id).c
   }
-  res.json({ ok: true, crisisId: ev.crisis_id, openLeft })
+  res.json({ ok: true, status: 'resolved', timelineId, crisisId: ev.crisis_id, openLeft: openEventCount(ev.crisis_id) })
 })
 
-// 批量解除某规则全部未解除触发（按危机合并写入时间线）
+// 批量解除某规则全部未解除触发（按危机合并写入一条时间线，ref 关联规则，幂等跳过已解除）
 app.post('/api/alerts/:id/resolve', (req, res) => {
   const al = q1('SELECT * FROM alerts WHERE id=?', req.params.id)
   if (!al) return res.status(404).json({ error: 'not found' })
   const events = q("SELECT * FROM alert_events WHERE alert_id=? AND status='open'", al.id)
   const note = (req.body.note || '').trim() || '风险指标回落，批量解除'
+  const ts = now()
   const byCrisis = {}
   for (const ev of events) {
-    run("UPDATE alert_events SET status='resolved', resolved=? WHERE id=?", now(), ev.id)
+    run("UPDATE alert_events SET status='resolved', resolved=?, resolve_source='manual' WHERE id=?", ts, ev.id)
     if (ev.crisis_id) (byCrisis[ev.crisis_id] ||= []).push(ev)
   }
+  const timelineIds = []
   for (const [cid, evs] of Object.entries(byCrisis)) {
     const c = q1('SELECT * FROM crisis WHERE id=?', cid)
     if (c && c.status !== 'closed') {
-      run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
-        c.id, '预警解除', `规则「${al.title}」：${note}（一并解除 ${evs.length} 条触发记录）`, now())
-      run('UPDATE crisis SET updated=? WHERE id=?', now(), c.id)
+      const tlId = addTimeline(c.id, '预警解除', `规则「${al.title}」：${note}（一并解除 ${evs.length} 条触发记录）`,
+        { kind: 'resolve', refType: 'alert_rule', refId: al.id, timeStr: ts })
+      timelineIds.push(tlId)
+      run('UPDATE crisis SET updated=? WHERE id=?', ts, c.id)
     }
   }
-  res.json({ ok: true, resolved: events.length })
+  res.json({ ok: true, resolved: events.length, timelineIds })
 })
 
 // ===== 危机处置 =====
@@ -267,7 +337,7 @@ app.post('/api/crisis', (req, res) => {
   const r = run("INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,origin,topic,last_trigger_at) VALUES (?,?,?,?,?,?,?,?,?,'manual',?,NULL)",
     title, level || 'orange', 'monitoring', plan || '', analysis || '', now(), now(), linked_email || '', keyword || '', (topic || '').trim())
   const id = Number(r.lastInsertRowid)
-  run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', id, '事件建档', '人工建档，初始响应', now())
+  addTimeline(id, '事件建档', '人工建档，初始响应', { kind: 'action' })
   res.json({ ok: true, id })
 })
 app.post('/api/crisis/:id/status', (req, res) => {
@@ -275,17 +345,51 @@ app.post('/api/crisis/:id/status', (req, res) => {
   const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
   run('UPDATE crisis SET status=?, updated=? WHERE id=?', status || c.status, now(), c.id)
-  run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', c.id, action || '状态更新', note || '', now())
+  addTimeline(c.id, action || '状态更新', note || '', { kind: 'action' })
   res.json({ ok: true })
 })
 app.post('/api/crisis/:id/timeline', (req, res) => {
   const { action, note } = req.body
-  run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', req.params.id, action, note || '', now())
+  addTimeline(req.params.id, action, note || '', { kind: 'action' })
   run('UPDATE crisis SET updated=? WHERE id=?', now(), req.params.id)
   res.json({ ok: true })
 })
 
-// 回溯：危机档案 + 承接规则 + 关联预警触发记录（按规则拆分）+ 统计
+// 统一事件时间线：处置时间线条目 + 预警触发/解除状态合并为一条流，按发生时间排序。
+// includeVoided=1 时返回含已失效（被回滚撤销）条目，供历史审计；默认隐藏。
+app.get('/api/crisis/:id/feed', (req, res) => {
+  const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
+  if (!c) return res.status(404).json({ error: 'not found' })
+  const includeVoided = req.query.voided === '1'
+  const tl = q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id ASC', c.id)
+  const evs = q(`SELECT ae.*, al.title alert_title, al.level alert_level, p.title pt, p.heat
+    FROM alert_events ae LEFT JOIN alerts al ON al.id=ae.alert_id LEFT JOIN posts p ON p.id=ae.post_id
+    WHERE ae.crisis_id=? ORDER BY ae.id ASC`, c.id)
+  const feed = []
+  for (const t of tl) {
+    if (!includeVoided && t.voided) continue
+    feed.push({
+      source: 'timeline', id: t.id, seq: t.id,
+      kind: t.kind, action: t.action, note: t.note, time: t.time,
+      tsMs: parseFeedMs(t.time), voided: !!t.voided, refType: t.ref_type, refId: t.ref_id
+    })
+  }
+  for (const e of evs) {
+    feed.push({
+      source: 'alert_event', id: e.id, seq: 10_000_000 + e.id,
+      kind: e.status === 'open' ? 'event_open' : 'event_resolved',
+      action: '预警触发', note: e.detail,
+      ruleTitle: e.alert_title, level: e.alert_level,
+      postTitle: e.pt, heat: e.heat,
+      status: e.status, resolved: e.resolved, resolveSource: e.resolve_source,
+      time: e.time, tsMs: e.event_at_ms ?? parseFeedMs(e.time), voided: false
+    })
+  }
+  feed.sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0) || a.seq - b.seq)
+  res.json({ crisisId: c.id, feed })
+})
+
+// 回溯：危机档案 + 承接规则 + 关联预警触发记录（按规则拆分）+ 统一口径统计
 app.get('/api/crisis/:id/review', (req, res) => {
   const c = q1('SELECT c.*, a.title alert_title FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id WHERE c.id=?', req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
@@ -293,7 +397,7 @@ app.get('/api/crisis/:id/review', (req, res) => {
   const events = q(`SELECT ae.*, p.title pt, p.heat, p.sentiment sent, a.title alert_title, a.level alert_level
     FROM alert_events ae LEFT JOIN posts p ON p.id=ae.post_id LEFT JOIN alerts a ON a.id=ae.alert_id
     WHERE ae.crisis_id=? ORDER BY ae.id DESC`, c.id)
-  const open = events.filter((e) => e.status === 'open').length
+  const open = openEventCount(c.id)
   // 按规则拆分触发统计（同一事件承接多条规则时分别统计）
   const rules = q(`SELECT ca.alert_id, ca.is_origin, ca.first_at, ca.last_at,
       al.title alert_title, al.level alert_level,
@@ -301,37 +405,69 @@ app.get('/api/crisis/:id/review', (req, res) => {
       (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=ca.crisis_id AND ae.alert_id=ca.alert_id AND ae.status='open') open
     FROM crisis_alerts ca LEFT JOIN alerts al ON al.id=ca.alert_id
     WHERE ca.crisis_id=? ORDER BY ca.is_origin DESC, ca.alert_id`, c.id)
+  const validTimeline = timeline.filter((t) => !t.voided)
   res.json({
     crisis: c, timeline, events, rules,
     stats: {
       triggers: events.length,
       open,
       resolved: events.length - open,
+      closeResolved: events.filter((e) => e.status === 'resolved' && e.resolve_source === 'close').length,
       rules: rules.length,
       posts: new Set(events.map((e) => e.post_id).filter((x) => x != null)).size,
+      actions: validTimeline.filter((t) => t.kind === 'action').length,
       firstAt: events.length ? events[events.length - 1].time : null,
       lastAt: events.length ? events[0].time : null
     }
   })
 })
 
-// 结案：写入回溯总结，级联解除关联的未解除预警，完成闭环
+// 结案：写入回溯总结，级联解除关联的未解除预警（标记 resolve_source='close'），完成闭环。
+// 时间线结案行 ref_type='close'，回滚时据此精确失效。
 app.post('/api/crisis/:id/close', (req, res) => {
   const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
   if (c.status === 'closed') return res.json({ ok: true, already: true })
   const summary = (req.body.summary || '').trim() || '预警解除，舆情回落，完成处置闭环。'
+  const ts = now()
   const opens = q("SELECT * FROM alert_events WHERE crisis_id=? AND status='open'", c.id)
-  for (const ev of opens) run("UPDATE alert_events SET status='resolved', resolved=? WHERE id=?", now(), ev.id)
-  run("UPDATE crisis SET status='closed', updated=? WHERE id=?", now(), c.id)
+  for (const ev of opens) run("UPDATE alert_events SET status='resolved', resolved=?, resolve_source='close' WHERE id=?", ts, ev.id)
+  run("UPDATE crisis SET status='closed', prev_status=?, closed_at=?, updated=? WHERE id=?", c.status, ts, ts, c.id)
   // 结案级联解除可能横跨多条规则，记录涉及的规则名
   const auto = opens.length
     ? `（同步解除 ${opens.length} 条未解除预警：${[...new Set(opens.map((e) => e.alert_id))].map((rid) => {
         const al = q1('SELECT title FROM alerts WHERE id=?', rid); return al ? `「${al.title}」` : '已删除规则'
       }).join('、')}）`
     : ''
-  run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', c.id, '事件结案', summary + auto, now())
-  res.json({ ok: true, resolved: opens.length })
+  const timelineId = addTimeline(c.id, '事件结案', summary + auto, { kind: 'close', refType: 'close', refId: null, timeStr: ts })
+  run('UPDATE crisis_timeline SET ref_id=? WHERE id=?', timelineId, timelineId)
+  res.json({ ok: true, resolved: opens.length, timelineId, openLeft: 0 })
+})
+
+// 结案回滚：恢复结案前状态，仅重开「随本次结案级联解除」的预警（手动解除的不动），
+// 失效对应的结案/解除时间线行（保留历史），追加「结案回滚」记录。支持反复结案/回滚。
+app.post('/api/crisis/:id/reopen', (req, res) => {
+  const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
+  if (!c) return res.status(404).json({ error: 'not found' })
+  if (c.status !== 'closed') return res.status(409).json({ error: '事件未结案，无需回滚' })
+  const ts = now()
+  // 最近一次有效结案行（同一事件可能经历多轮结案/回滚）
+  const closeRow = q1("SELECT * FROM crisis_timeline WHERE crisis_id=? AND kind='close' AND voided=0 ORDER BY id DESC LIMIT 1", c.id)
+  const reopened = q("SELECT * FROM alert_events WHERE crisis_id=? AND status='resolved' AND resolve_source='close'", c.id)
+  for (const ev of reopened) {
+    run("UPDATE alert_events SET status='open', resolved=NULL, resolve_source='manual' WHERE id=?", ev.id)
+  }
+  // 失效结案行及其期间的解除行（仅失效本轮结案之后、未被手动撤销的行）
+  if (closeRow) {
+    run('UPDATE crisis_timeline SET voided=1 WHERE id=?', closeRow.id)
+    run("UPDATE crisis_timeline SET voided=1 WHERE crisis_id=? AND kind='resolve' AND voided=0 AND id>?", c.id, closeRow.id)
+  }
+  const restoreStatus = c.prev_status || (openEventCount(c.id) > 0 ? 'disposal' : 'monitoring')
+  run("UPDATE crisis SET status=?, closed_at=NULL, updated=? WHERE id=?", restoreStatus, ts, c.id)
+  addTimeline(c.id, '结案回滚',
+    (req.body.note || '').trim() || `回滚结案，恢复为「${restoreStatus === 'disposal' ? '处置中' : '监测中'}」，重开 ${reopened.length} 条随结案解除的预警`,
+    { kind: 'reopen', refType: 'close', refId: closeRow ? closeRow.id : null, timeStr: ts })
+  res.json({ ok: true, restoredStatus: restoreStatus, reopened: reopened.length, openLeft: openEventCount(c.id) })
 })
 app.delete('/api/crisis/:id', (req, res) => {
   run('DELETE FROM crisis_alerts WHERE crisis_id=?', req.params.id)

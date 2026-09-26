@@ -54,7 +54,9 @@ CREATE TABLE IF NOT EXISTS alert_events (
   detail TEXT NOT NULL,
   time TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',  -- open/resolved（预警是否解除）
-  resolved TEXT                   -- 解除时间
+  resolved TEXT,                  -- 解除时间
+  resolve_source TEXT NOT NULL DEFAULT 'manual', -- manual=手动解除 / close=结案级联解除（回滚结案时仅重开此类）
+  event_at_ms INTEGER             -- 触发毫秒时间戳（统一时间线排序/窗口判定）
 );
 CREATE TABLE IF NOT EXISTS crisis (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,7 +72,9 @@ CREATE TABLE IF NOT EXISTS crisis (
   alert_id INTEGER,               -- 来源预警规则（自动建档时写入）
   origin TEXT NOT NULL DEFAULT 'manual',  -- auto/manual
   topic TEXT NOT NULL DEFAULT '',  -- 归并话题键（同一话题+窗口内的预警触发并入同一事件）
-  last_trigger_at INTEGER          -- 最近预警触发毫秒时间戳（时间窗口归并判断依据）
+  last_trigger_at INTEGER,         -- 最近预警触发毫秒时间戳（时间窗口归并判断依据）
+  closed_at TEXT,                  -- 最近结案时间（回滚后清空）
+  prev_status TEXT                 -- 结案前状态（回滚结案时恢复）
 );
 CREATE TABLE IF NOT EXISTS crisis_alerts (
   crisis_id INTEGER NOT NULL,
@@ -85,7 +89,11 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   crisis_id INTEGER NOT NULL,
   action TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
-  time TEXT NOT NULL
+  time TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'action', -- action=处置动作 / resolve=预警解除 / close=结案 / reopen=结案回滚 / trigger=规则触发
+  ref_type TEXT NOT NULL DEFAULT '',   -- 关联对象类型：alert_event/alert_rule/close（回滚时按此精确撤回）
+  ref_id INTEGER,                      -- 关联对象 id（alert_events.id / alerts.id / 上一次结案时间线 id）
+  voided INTEGER NOT NULL DEFAULT 0    -- 1=已失效（结案回滚时撤销对应的解除/结案条目，保留历史行）
 );
 -- 可恢复批量导入：任务主表（幂等标识、状态机、进度、结果汇总）
 CREATE TABLE IF NOT EXISTS import_jobs (
@@ -142,6 +150,14 @@ function ensureColumn(table, col, ddl) {
 ensureColumn('alert_events', 'crisis_id', 'crisis_id INTEGER')
 ensureColumn('alert_events', 'status', "status TEXT NOT NULL DEFAULT 'open'")
 ensureColumn('alert_events', 'resolved', 'resolved TEXT')
+ensureColumn('alert_events', 'resolve_source', "resolve_source TEXT NOT NULL DEFAULT 'manual'")
+ensureColumn('alert_events', 'event_at_ms', 'event_at_ms INTEGER')
+ensureColumn('crisis_timeline', 'kind', "kind TEXT NOT NULL DEFAULT 'action'")
+ensureColumn('crisis_timeline', 'ref_type', "ref_type TEXT NOT NULL DEFAULT ''")
+ensureColumn('crisis_timeline', 'ref_id', 'ref_id INTEGER')
+ensureColumn('crisis_timeline', 'voided', 'voided INTEGER NOT NULL DEFAULT 0')
+ensureColumn('crisis', 'closed_at', 'closed_at TEXT')
+ensureColumn('crisis', 'prev_status', 'prev_status TEXT')
 ensureColumn('crisis', 'alert_id', 'alert_id INTEGER')
 ensureColumn('crisis', 'origin', "origin TEXT NOT NULL DEFAULT 'manual'")
 ensureColumn('alerts', 'merge_topic', "merge_topic TEXT NOT NULL DEFAULT ''")
@@ -221,6 +237,33 @@ function migrateLegacyLinks() {
 }
 migrateLegacyLinks()
 
+// 迁移：升级「解除/结案/回滚」链路所需的历史数据（幂等，可重复执行）。
+// 1) 回填触发毫秒时间戳（统一时间线排序/窗口判定）；
+// 2) 历史上随结案级联解除的记录无来源标记：已结案事件下所有 resolved 记录置 close，
+//    使结案回滚可以正确重开这些历史预警（未结案事件的保持 manual）；
+// 3) 按时间线 action 文本回填 kind（预警解除/事件结案/规则触发），历史行原样保留不删改。
+function migrateResolveCloseChain() {
+  const events = db.prepare('SELECT id, time FROM alert_events WHERE event_at_ms IS NULL').all()
+  const updMs = db.prepare('UPDATE alert_events SET event_at_ms=? WHERE id=?')
+  for (const e of events) {
+    const ms = parseTimeMs(e.time)
+    if (ms != null) updMs.run(ms, e.id)
+  }
+  db.exec(`UPDATE alert_events SET resolve_source='close'
+    WHERE status='resolved' AND COALESCE(resolve_source,'') IN ('','manual')
+      AND crisis_id IN (SELECT id FROM crisis WHERE status='closed')`)
+  const tlKind = db.prepare("UPDATE crisis_timeline SET kind=? WHERE kind='action' AND action=?")
+  tlKind.run('resolve', '预警解除')
+  tlKind.run('close', '事件结案')
+  tlKind.run('trigger', '预警再次触发')
+  tlKind.run('trigger', '规则归并')
+  // 历史结案时间：取该事件最近一次「事件结案」时间线时间回填 closed_at
+  db.exec(`UPDATE crisis SET closed_at=(SELECT t.time FROM crisis_timeline t
+      WHERE t.crisis_id=crisis.id AND t.action='事件结案' AND t.voided=0 ORDER BY t.id DESC LIMIT 1)
+    WHERE status='closed' AND closed_at IS NULL`)
+}
+migrateResolveCloseChain()
+
 function seed() {
   const n = db.prepare('SELECT COUNT(*) c FROM posts').get().c
   if (n > 0) return
@@ -296,24 +339,28 @@ function seed() {
   cl.run(c3, a3, 0, ago(2880), ago(2880))
 
   // 预警触发记录：c1/c2 由预警自动建档，c2 第二次触发去重并入；黄色规则不自动建档
-  const ae = db.prepare('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)')
-  ae.run(a1, 5, c1, '命中关键词「卫生」· 情感：negative · 热度90', ago(180), 'open', null)
-  ae.run(a2, 1, c2, '命中关键词「投诉」· 情感：negative · 热度82', ago(90), 'open', null)
-  ae.run(a2, 12, c2, '命中关键词「投诉」· 情感：negative · 热度74', ago(30), 'open', null)
-  ae.run(a3, 8, null, '命中关键词「延期」· 情感：negative · 热度78', ago(60), 'open', null)
+  const ae = db.prepare('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved,resolve_source,event_at_ms) VALUES (?,?,?,?,?,?,?,?,?)')
+  const aeRun = (rid, pid, cid, detail, t, status, resolved, source) =>
+    ae.run(rid, pid, cid, detail, t, status, resolved, source, parseTimeMs(t))
+  aeRun(a1, 5, c1, '命中关键词「卫生」· 情感：negative · 热度90', ago(180), 'open', null, 'manual')
+  aeRun(a2, 1, c2, '命中关键词「投诉」· 情感：negative · 热度82', ago(90), 'open', null, 'manual')
+  aeRun(a2, 12, c2, '命中关键词「投诉」· 情感：negative · 热度74', ago(30), 'open', null, 'manual')
+  aeRun(a3, 8, null, '命中关键词「延期」· 情感：negative · 热度78', ago(60), 'open', null, 'manual')
   // c3 人工建档但处置期承接了 a2/a3 两条规则，结案时已一并解除（历史闭环）
-  ae.run(a2, 11, c3, '命中关键词「投诉」· 情感：negative · 热度70', ago(4310), 'resolved', ago(2880))
-  ae.run(a3, 11, c3, '命中关键词「延期」· 情感：negative · 热度66', ago(2880), 'resolved', ago(2880))
+  aeRun(a2, 11, c3, '命中关键词「投诉」· 情感：negative · 热度70', ago(4310), 'resolved', ago(2880), 'close')
+  aeRun(a3, 11, c3, '命中关键词「延期」· 情感：negative · 热度66', ago(2880), 'resolved', ago(2880), 'close')
 
-  const ct = db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
-  ;[['自动建档', '高等级预警触发：命中关键词「卫生」· 情感：negative · 热度90', ago(180)],
-    ['全网回应', '官方发布回应声明', ago(150)],
-    ['关停门店', '涉事门店暂停营业，启动自查', ago(120)]].forEach((t) => ct.run(c1, t[0], t[1], t[2]))
-  ;[['自动建档', '高等级预警触发：命中关键词「投诉」· 情感：negative · 热度82', ago(90)],
-    ['预警再次触发', '命中关键词「投诉」· 情感：negative · 热度74 · 关联舆情《某新能源汽车充电服务再引分歧》', ago(30)]].forEach((t) => ct.run(c2, t[0], t[1], t[2]))
-  ;[['事件建档', '人工建档，进入监测', ago(4320)],
-    ['启动处置', '发布定价说明，开通集中答疑', ago(4300)],
-    ['预警解除', '风险指标回落，预警解除', ago(2880)],
-    ['事件结案', '舆情热度回落至常态区间，负面占比降至 5% 以下，完成处置闭环。', ago(2840)]].forEach((t) => ct.run(c3, t[0], t[1], t[2]))
+  const ct = db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time,kind) VALUES (?,?,?,?,?)')
+  const tl = (cid, action, note, t, kind = 'action') => ct.run(cid, action, note, t, kind)
+  tl(c1, '自动建档', '高等级预警触发：命中关键词「卫生」· 情感：negative · 热度90', ago(180), 'auto')
+  tl(c1, '全网回应', '官方发布回应声明', ago(150))
+  tl(c1, '关停门店', '涉事门店暂停营业，启动自查', ago(120))
+  tl(c2, '自动建档', '高等级预警触发：命中关键词「投诉」· 情感：negative · 热度82', ago(90), 'auto')
+  tl(c2, '预警再次触发', '命中关键词「投诉」· 情感：negative · 热度74 · 关联舆情《某新能源汽车充电服务再引分歧》', ago(30), 'trigger')
+  tl(c3, '事件建档', '人工建档，进入监测', ago(4320))
+  tl(c3, '启动处置', '发布定价说明，开通集中答疑', ago(4300))
+  tl(c3, '预警解除', '风险指标回落，预警解除', ago(2880), 'resolve')
+  tl(c3, '事件结案', '舆情热度回落至常态区间，负面占比降至 5% 以下，完成处置闭环。', ago(2840), 'close')
+  db.prepare('UPDATE crisis SET closed_at=? WHERE id=?').run(ago(2840), c3)
 }
 seed()

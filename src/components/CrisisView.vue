@@ -2,7 +2,7 @@
   <div class="crisis">
     <div class="toolbar">
       <button class="add" @click="showForm=!showForm">＋ 新建危机事件</button>
-      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：同规则不同话题/超窗分别建档，同一事件可承接多条规则；预警解除与结案自动同步时间线</span>
+      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并，一帖命中多规则只建一个事件；解除可撤销、结案可回滚（回滚重开随结案解除的预警），时间线全程留痕</span>
     </div>
 
     <form v-if="showForm" class="c-form" @submit.prevent="create">
@@ -58,10 +58,10 @@
         <div class="timeline-block">
           <h5>🕒 处置时间线</h5>
           <div class="tl">
-            <div v-for="(t,i) in c.timeline" :key="t.id" class="tl-item">
-              <span class="tl-dot" :class="{latest:i===0}"></span>
+            <div v-for="(t,i) in c.timeline" :key="t.id" class="tl-item" :class="{voided:t.voided}">
+              <span class="tl-dot" :class="{latest:i===0 && !t.voided, undone:t.voided}"></span>
               <div class="tl-body">
-                <b>{{ t.action }}</b>
+                <b>{{ t.action }}<i v-if="t.voided" class="void-tag">已撤销</i></b>
                 <span>{{ t.note }}</span>
                 <em>{{ t.time }}</em>
               </div>
@@ -94,19 +94,45 @@
                 <b>{{ e.detail }}</b>
                 <span v-if="e.pt">关联舆情《{{ e.pt }}》 · 热度{{ e.heat }}</span>
               </div>
-              <span class="rv-st" :class="e.status">{{ e.status==='resolved' ? '已解除' : '待处置' }}</span>
+              <span v-if="e.status==='resolved'" class="rv-rs-line">
+                <em class="rv-st resolved">{{ e.resolve_source==='close' ? '结案解除' : '已解除' }}</em>
+                <button v-if="c.status!=='closed' && e.resolve_source!=='close'" class="mini-undo" @click="undoEvent(e, c)">撤销</button>
+              </span>
+              <span v-else class="rv-st open">待处置</span>
             </div>
           </div>
           <div v-else class="rv-none">无关联预警触发记录（人工建档）</div>
 
+          <!-- 统一事件时间线：触发记录与处置动作按时间混排 -->
+          <div v-if="feed && feedId===c.id" class="rv-feed">
+            <div class="rv-feed-head">
+              <span>🧭 统一事件时间线（{{ feed.length }} 条）</span>
+              <label class="feed-toggle"><input type="checkbox" v-model="showVoided" @change="loadFeed(c)" />含已撤销记录</label>
+            </div>
+            <div class="feed-list">
+              <div v-for="f in feed" :key="f.source+'-'+f.id" class="feed-item" :class="[f.source, f.kind, {voided:f.voided}]">
+                <span class="feed-dot"></span>
+                <div class="feed-body">
+                  <b>{{ feedAction(f) }}</b>
+                  <span>{{ feedNote(f) }}</span>
+                  <em>{{ f.time }}</em>
+                </div>
+                <i v-if="f.voided" class="feed-void">已撤销</i>
+              </div>
+            </div>
+          </div>
+
           <div v-if="c.status!=='closed'" class="close-box">
             <textarea v-model="closeSummary" placeholder="结案回溯总结：处置结果、舆情回落情况、经验沉淀…"></textarea>
             <div class="close-row">
-              <span v-if="review.stats.open" class="cascade">结案将同步解除 {{ review.stats.open }} 条未解除预警</span>
+              <span v-if="review.stats.open" class="cascade">结案将同步解除 {{ review.stats.open }} 条未解除预警（可回滚重开）</span>
               <button class="close" @click="confirmClose(c)">✔ 确认结案</button>
             </div>
           </div>
-          <div v-else class="closed-tip">✅ 已结案 · 回溯只读</div>
+          <div v-else class="closed-tip">
+            ✅ 已结案 · 回溯只读
+            <button class="reopen" @click="confirmReopen(c)">↩ 回滚结案</button>
+          </div>
         </div>
 
         <div class="actions">
@@ -114,6 +140,7 @@
           <button v-if="c.status==='monitoring'||c.status==='disposal'" class="prog" @click="advance(c)">推进处置</button>
           <button class="ghost" @click="toggleReview(c)">{{ reviewId===c.id ? '收起回溯' : '🔍 回溯' }}</button>
           <button v-if="c.status!=='closed'" class="close" @click="toggleReview(c, true)">结案</button>
+          <button v-else class="reopen-btn" @click="confirmReopen(c)">↩ 回滚结案</button>
         </div>
       </div>
     </div>
@@ -129,6 +156,14 @@ const form = ref({ title: '', level: 'orange', topic: '', keyword: '', linked_em
 const reviewId = ref(null)
 const review = ref(null)
 const closeSummary = ref('')
+const feed = ref(null)
+const feedId = ref(null)
+const showVoided = ref(false)
+
+async function loadFeed(c) {
+  feed.value = await store.fetchCrisisFeed(c.id, showVoided.value)
+  feedId.value = c.id
+}
 
 function create() {
   store.addCrisis({ ...form.value })
@@ -146,19 +181,48 @@ function addStep(c) {
   if (note) store.addCrisisTimeline(c.id, { action: '处置记录', note })
 }
 async function toggleReview(c, forClose = false) {
-  if (reviewId.value === c.id && !forClose) { reviewId.value = null; review.value = null; return }
+  if (reviewId.value === c.id && !forClose) { reviewId.value = null; review.value = null; feedId.value = null; feed.value = null; return }
   review.value = await store.fetchCrisisReview(c.id)
   reviewId.value = c.id
   closeSummary.value = c.status === 'closed' ? '' : defaultSummary(c)
+  await loadFeed(c)
+}
+function feedAction(f) {
+  if (f.source === 'alert_event') return f.status === 'open' ? '🔔 预警触发（待处置）' : '✅ 预警解除'
+  return { create: '🆕 自动建档', trigger: '🔔 规则触发', resolve: '✔ 预警解除', close: '📁 事件结案', reopen: '↩ 结案回滚', action: '📝 处置动作' }[f.kind] || f.action
+}
+function feedNote(f) {
+  if (f.source === 'alert_event') {
+    const rule = f.ruleTitle ? `规则「${f.ruleTitle}」· ` : ''
+    return rule + f.note + (f.postTitle ? ` · 《${f.postTitle}》` : '')
+  }
+  return f.note
 }
 function defaultSummary(c) {
   return `「${c.title}」处置完毕，舆情热度回落至常态区间，未出现次生舆情，完成闭环。`
 }
 async function confirmClose(c) {
-  if (!confirm(`确定结案「${c.title}」？`)) return
+  if (!confirm(`确定结案「${c.title}」？结案将同步解除未解除预警，之后可回滚。`)) return
   await store.closeCrisis(c.id, closeSummary.value)
   reviewId.value = null
   review.value = null
+  feed.value = null; feedId.value = null
+}
+async function confirmReopen(c) {
+  if (!confirm(`回滚结案「${c.title}」？将恢复结案前状态，并重开随结案解除的预警。`)) return
+  await store.reopenCrisis(c.id)
+  if (reviewId.value === c.id) {
+    review.value = await store.fetchCrisisReview(c.id)
+    await loadFeed(c)
+  }
+}
+async function undoEvent(e, c) {
+  if (!confirm('撤销该预警的解除？预警将重新生效。')) return
+  try {
+    await store.undoResolveAlertEvent(e.id)
+    review.value = await store.fetchCrisisReview(c.id)
+    await loadFeed(c)
+  } catch (err) { alert(err.message) }
 }
 async function del(c) {
   if (confirm(`删除危机「${c.title}」？`)) await store.delCrisis(c.id)
@@ -208,8 +272,11 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .timeline-block{margin-top:12px;background:#13233f;border-radius:10px;padding:12px;}
 .tl{border-left:2px solid #243357;padding-left:14px;display:flex;flex-direction:column;gap:8px;max-height:160px;overflow-y:auto;}
 .tl-item{position:relative;}
+.tl-item.voided{opacity:.45;}
 .tl-dot{position:absolute;left:-19px;top:4px;width:9px;height:9px;border-radius:50%;background:#546e7a;}
 .tl-dot.latest{background:#ffd54f;}
+.tl-dot.undone{background:#546e7a;}
+.void-tag{font-style:normal;font-size:9px;color:#ffab91;background:#3e2723;border:1px solid rgba(255,138,101,.3);border-radius:4px;padding:0 5px;margin-left:6px;font-weight:400;}
 .tl-body b{color:#dbe4f3;font-size:12px;display:block;}
 .tl-body span{color:#8ba2c8;font-size:11px;}
 .tl-body em{color:#5b6f94;font-size:10px;font-style:normal;display:block;margin-top:2px;}
@@ -243,7 +310,30 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .close-box textarea{min-height:56px;}
 .close-row{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;}
 .cascade{font-size:10px;color:#ffab91;}
-.closed-tip{color:#81c784;font-size:11px;text-align:center;padding:6px 0 2px;}
+.closed-tip{color:#81c784;font-size:11px;text-align:center;padding:6px 0 2px;display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;}
+.reopen{background:none;border:1px solid rgba(255,171,145,.5);color:#ffab91;cursor:pointer;border-radius:7px;padding:4px 10px;font-size:11px;}
+.reopen-btn{background:none;border:1px solid rgba(255,171,145,.5);color:#ffab91;cursor:pointer;border-radius:8px;padding:7px 12px;font-size:12px;font-weight:600;}
+.rv-rs-line{display:flex;align-items:center;gap:6px;flex:none;}
+.mini-undo{background:none;border:1px solid rgba(255,171,145,.4);color:#ffab91;cursor:pointer;border-radius:5px;padding:1px 6px;font-size:10px;}
+.rv-feed{background:#0a1626;border:1px dashed rgba(144,202,249,.2);border-radius:8px;padding:10px;margin-bottom:10px;}
+.rv-feed-head{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#90caf9;margin-bottom:8px;}
+.feed-toggle{font-size:10px;color:#8ba2c8;font-weight:400;display:flex;align-items:center;gap:4px;}
+.feed-toggle input{width:auto;}
+.feed-list{max-height:200px;overflow-y:auto;border-left:2px solid #243357;padding-left:12px;display:flex;flex-direction:column;gap:7px;}
+.feed-item{position:relative;display:flex;align-items:flex-start;gap:8px;}
+.feed-item.voided{opacity:.45;}
+.feed-dot{position:absolute;left:-17px;top:5px;width:8px;height:8px;border-radius:50%;background:#546e7a;}
+.feed-item.alert_event .feed-dot{background:#42a5f5;}
+.feed-item.create .feed-dot{background:#66bb6a;}
+.feed-item.trigger .feed-dot{background:#ffb300;}
+.feed-item.resolve .feed-dot{background:#81c784;}
+.feed-item.close .feed-dot{background:#66bb6a;}
+.feed-item.reopen .feed-dot{background:#ffab91;}
+.feed-body{flex:1;min-width:0;}
+.feed-body b{color:#dbe4f3;font-size:11px;display:block;}
+.feed-body span{color:#8ba2c8;font-size:10px;display:block;}
+.feed-body em{color:#5b6f94;font-size:9px;font-style:normal;display:block;}
+.feed-void{font-style:normal;font-size:9px;color:#ffab91;background:#3e2723;border-radius:4px;padding:0 5px;flex:none;margin-top:2px;}
 .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
 .prog{background:linear-gradient(135deg,#ef6c00,#e65100);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .close{background:linear-gradient(135deg,#2e7d32,#1b5e20);border:none;color:#fff;font-weight:600;cursor:pointer;}

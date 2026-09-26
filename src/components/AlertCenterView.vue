@@ -18,8 +18,9 @@
             <input v-model="form.merge_topic" placeholder="归并话题（留空=取舆情话题）" />
             <input v-model.number="form.merge_window" type="number" min="0" placeholder="时间窗口(分,0不限)" />
           </div>
-          <button class="save" type="submit">保存规则</button>
-          <p class="hint">💡 红/橙级规则触发后自动建档危机事件；按「话题 + 时间窗口」归并——同规则下不同话题/超窗分别建档，同一事件可承接多条规则。</p>
+          <button class="save" type="submit">{{ editingId ? '保存修改' : '保存规则' }}</button>
+          <button v-if="editingId" type="button" class="cancel" @click="cancelEdit">取消编辑</button>
+          <p class="hint">💡 红/橙级规则触发后自动建档危机事件；按「话题 + 时间窗口」归并——同规则下不同话题/超窗分别建档，同一事件可承接多条规则；一帖命中多规则时只建一个事件。修改窗口/话题即时生效，历史记录不变。</p>
         </form>
         <div class="rule-list">
           <div v-for="a in alertList" :key="a.id" class="rule" :class="a.level">
@@ -34,6 +35,7 @@
             <span v-if="openCount(a.id)" class="open-tag">🔔 未解除 {{ openCount(a.id) }}</span>
             <div class="r-btns">
               <button v-if="openCount(a.id)" class="resolve" @click="resolveAll(a)">全部解除</button>
+              <button class="edit" @click="startEdit(a)">编辑</button>
               <label class="switch">
                 <input type="checkbox" :checked="!!a.active" @change="store.toggleAlert(a.id)" />
                 <span></span>
@@ -55,11 +57,15 @@
               <b>{{ e.detail }}</b>
               <span v-if="e.pt" class="e-post">关联：{{ e.pt }}</span>
               <span v-if="e.crisis_id" class="e-crisis">🛟 {{ e.crisis_title || '危机事件' }} #{{ e.crisis_id }}</span>
-              <span v-if="e.status==='resolved'" class="e-resolved">✅ 已解除 · {{ e.resolved }}</span>
+              <span v-if="e.status==='resolved'" class="e-resolved">
+                ✅ {{ e.resolve_source === 'close' ? '结案级联解除' : '已解除' }} · {{ e.resolved }}
+              </span>
             </div>
             <div class="e-side">
               <span class="e-time">{{ e.time }}</span>
               <button v-if="e.status!=='resolved'" class="resolve" @click="resolveOne(e)">解除</button>
+              <button v-else-if="e.resolve_source!=='close'" class="undo" @click="undoOne(e)">撤销解除</button>
+              <span v-else class="undo-locked">随结案解除</span>
             </div>
           </div>
         </div>
@@ -74,7 +80,9 @@ import { usePubStore } from '@/store/pub'
 const store = usePubStore()
 const alertList = ref([])
 const events = ref([])
-const form = ref({ title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60, merge_topic: '', merge_window: 0 })
+const editingId = ref(null)
+const emptyForm = () => ({ title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60, merge_topic: '', merge_window: 0 })
+const form = ref(emptyForm())
 
 async function load() {
   const d = await store.fetchAlerts()
@@ -82,10 +90,23 @@ async function load() {
   events.value = d.events
 }
 function add() {
+  if (editingId.value) {
+    store.updateAlert(editingId.value, { ...form.value }).then(() => load())
+    cancelEdit()
+    return
+  }
   store.saveAlert(form.value)
-  form.value = { title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60, merge_topic: '', merge_window: 0 }
+  form.value = emptyForm()
   load()
 }
+function startEdit(a) {
+  editingId.value = a.id
+  form.value = {
+    title: a.title, level: a.level, keyword: a.keyword, sentiment: a.sentiment,
+    heat_min: a.heat_min, merge_topic: a.merge_topic, merge_window: a.merge_window
+  }
+}
+function cancelEdit() { editingId.value = null; form.value = emptyForm() }
 function eLevel(alertId) {
   const a = alertList.value.find((x) => x.id === alertId)
   return a ? a.level : ''
@@ -98,6 +119,15 @@ async function resolveOne(e) {
   if (note == null) return
   await store.resolveAlertEvent(e.id, note)
   load()
+}
+async function undoOne(e) {
+  if (!confirm('撤销该预警的解除？预警将重新生效，对应时间线记录将标记失效。')) return
+  try {
+    await store.undoResolveAlertEvent(e.id)
+    load()
+  } catch (err) {
+    alert(err.message)
+  }
 }
 async function resolveAll(a) {
   if (!confirm(`解除规则「${a.title}」全部 ${openCount(a.id)} 条未解除预警？`)) return
@@ -130,6 +160,10 @@ input,select,button{font-family:inherit;background:#0f1b38;border:1px solid rgba
 .open-tag{font-size:10px;color:#ffab91;background:#3e2723;border:1px solid rgba(255,138,101,.3);border-radius:5px;padding:1px 6px;margin-left:6px;}
 .hint{margin:0;font-size:10px;color:#5b6f94;line-height:1.5;}
 .resolve{background:none;border:1px solid rgba(102,187,106,.45);color:#81c784;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;}
+.edit{background:none;border:1px solid rgba(144,202,249,.4);color:#90caf9;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;}
+.cancel{background:#37474f;border:none;color:#b0bec5;cursor:pointer;border-radius:8px;padding:8px 10px;font-size:12px;}
+.undo{background:none;border:1px solid rgba(255,171,145,.4);color:#ffab91;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;white-space:nowrap;}
+.undo-locked{font-size:9px;color:#5b6f94;white-space:nowrap;}
 .r-btns{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:6px;}
 .switch{position:relative;width:36px;height:20px;display:inline-block;}
 .switch input{opacity:0;width:0;height:0;}

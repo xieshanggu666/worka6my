@@ -10,6 +10,19 @@
       <div class="stat red"><span class="s-ic">📢</span><b>{{ s.negRate }}%</b><em>负面占比</em></div>
     </div>
 
+    <!-- 预警→危机闭环统计（与预警中心/危机列表/回溯同一口径） -->
+    <div class="ov-grid">
+      <div class="ov"><b class="blue">{{ ov.rules }}</b><em>生效规则</em></div>
+      <div class="ov"><b class="amber">{{ ov.openEvents }}</b><em>未解除预警</em></div>
+      <div class="ov"><b class="green">{{ ov.resolvedEvents }}</b><em>累计解除</em></div>
+      <div class="ov"><b class="green2">{{ ov.closeResolved }}</b><em>结案级联解除</em></div>
+      <div class="ov"><b>{{ ov.crisesTotal }}</b><em>危机事件</em></div>
+      <div class="ov"><b class="red-t">{{ ov.crisesByStatus?.monitoring || 0 }}</b><em>监测中</em></div>
+      <div class="ov"><b class="orange-t">{{ ov.crisesByStatus?.disposal || 0 }}</b><em>处置中</em></div>
+      <div class="ov"><b class="green-t">{{ ov.crisesByStatus?.closed || 0 }}</b><em>已结案</em></div>
+      <div class="ov"><b class="purple">{{ ov.multiRule }}</b><em>多规则承接事件</em></div>
+    </div>
+
     <div class="grid">
       <!-- 情感占比 -->
       <div class="card">
@@ -94,6 +107,7 @@ import { computed } from 'vue'
 import { usePubStore } from '@/store/pub'
 const store = usePubStore()
 const s = computed(() => store.stats || {})
+const ov = computed(() => store.overview || {})
 const hotWords = computed(() => store.hotWords)
 const sources = computed(() => store.sources)
 const trend = computed(() => store.trend)
@@ -132,6 +146,12 @@ function statusText(st) { return { monitoring: '监测中', disposal: '处置中
 .stat b{font-size:26px;color:#fff;}.stat em{font-size:11px;color:#8ba2c8;font-style:normal;}
 .s-ic{font-size:20px;}
 .stat.pos b{color:#66bb6a;}.stat.neu b{color:#90a4ae;}.stat.neg b{color:#ef5350;}.stat.warn b{color:#ffb300;}.stat.red b{color:#ef5350;}
+.ov-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;}
+.ov{background:linear-gradient(135deg,#10204a,#0c1830);border:1px solid rgba(120,160,220,.18);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;align-items:center;gap:1px;}
+.ov b{font-size:20px;color:#dbe4f3;line-height:1.2;}
+.ov b.blue{color:#42a5f5;}.ov b.amber{color:#ffb300;}.ov b.green{color:#81c784;}.ov b.green2{color:#66bb6a;}
+.ov b.red-t{color:#ef5350;}.ov b.orange-t{color:#ff9800;}.ov b.green-t{color:#66bb6a;}.ov b.purple{color:#ce93d8;}
+.ov em{font-size:10px;color:#8ba2c8;font-style:normal;}
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;}
 @media(max-width:860px){.grid{grid-template-columns:1fr;}}
 .card{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;}

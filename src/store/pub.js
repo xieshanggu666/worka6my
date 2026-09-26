@@ -13,14 +13,14 @@ async function api(path, method = 'GET', body, qs, extraHeaders) {
 export const usePubStore = defineStore('pub', {
   state: () => ({
     loaded: false,
-    sources: [], hotWords: [], activeAlerts: [], crises: [], stats: {}, trend: [],
+    sources: [], hotWords: [], activeAlerts: [], crises: [], stats: {}, trend: [], overview: {},
     toast: null
   }),
   actions: {
     async load() {
       const d = await api('/state')
       this.sources = d.sources; this.hotWords = d.hotWords; this.activeAlerts = d.activeAlerts
-      this.crises = d.crises; this.stats = d.stats; this.trend = d.trend
+      this.crises = d.crises; this.stats = d.stats; this.trend = d.trend; this.overview = d.overview || {}
       this.loaded = true
     },
     msg(msg, type = 'info') { this.toast = { msg, type, id: Date.now() } },
@@ -47,12 +47,19 @@ export const usePubStore = defineStore('pub', {
     async resumeImport(id) { return await api(`/imports/${id}/resume`, 'POST') },
     async fetchAlerts() { return await api('/alerts') },
     async saveAlert(a) { await api('/alerts', 'POST', a); await this.load(); this.msg('预警规则已保存', 'success') },
+    async updateAlert(id, patch) { await api(`/alerts/${id}`, 'PATCH', patch); await this.load(); this.msg('规则配置已更新（时间窗口即时生效）', 'success') },
     async toggleAlert(id) { await api(`/alerts/${id}/toggle`, 'POST'); await this.load() },
     async deleteAlert(id) { await api('/alerts/' + id, 'DELETE'); await this.load() },
     async resolveAlertEvent(id, note) {
       const r = await api(`/alert-events/${id}/resolve`, 'POST', { note })
       await this.load()
       this.msg(r.crisisId ? `预警已解除，已同步危机 #${r.crisisId} 时间线` : '预警已解除', 'success')
+      return r
+    },
+    async undoResolveAlertEvent(id) {
+      const r = await api(`/alert-events/${id}/resolve`, 'POST', { undo: true })
+      await this.load()
+      this.msg(r.crisisId ? `已撤销解除，危机 #${r.crisisId} 的预警重新生效` : '已撤销解除，预警重新生效', 'warn')
       return r
     },
     async resolveAlert(id, note) {
@@ -69,10 +76,17 @@ export const usePubStore = defineStore('pub', {
     async setCrisisStatus(id, st) { await api(`/crisis/${id}/status`, 'POST', st); await this.load() },
     async addCrisisTimeline(id, t) { await api(`/crisis/${id}/timeline`, 'POST', t); await this.load() },
     async fetchCrisisReview(id) { return await api(`/crisis/${id}/review`) },
+    async fetchCrisisFeed(id, includeVoided) { return await api(`/crisis/${id}/feed` + (includeVoided ? '?voided=1' : '')) },
     async closeCrisis(id, summary) {
       const r = await api(`/crisis/${id}/close`, 'POST', { summary })
       await this.load()
       this.msg(r.resolved ? `事件已结案，同步解除 ${r.resolved} 条预警` : '事件已结案', 'success')
+      return r
+    },
+    async reopenCrisis(id, note) {
+      const r = await api(`/crisis/${id}/reopen`, 'POST', { note })
+      await this.load()
+      this.msg(`已回滚结案：恢复为${r.restoredStatus === 'disposal' ? '处置中' : '监测中'}，重开 ${r.reopened} 条预警`, 'warn')
       return r
     },
     async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() }
