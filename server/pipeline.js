@@ -8,6 +8,13 @@ export const now = () => new Date().toLocaleString('zh-CN')
 // 高等级预警（红/橙）触发时自动建档危机事件
 export const AUTO_LEVELS = ['red', 'orange']
 export const LV_TEXT = { red: '红色', orange: '橙色', yellow: '黄色' }
+export const LV_RANK = { red: 3, orange: 2, yellow: 1 }
+
+// 统一时间线：建档/归并/解除/结案/回滚/规则变更等所有危机动作经此写入，并刷新事件更新时间
+export function addTimeline(crisisId, action, note, timeStr = now()) {
+  run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', crisisId, action, note || '', timeStr)
+  run('UPDATE crisis SET updated=? WHERE id=?', timeStr, crisisId)
+}
 
 // 承接某事件的规则关联（无则插入），刷新最近触发时间
 export function attachRule(crisisId, alertId, isOrigin, timeStr) {
@@ -110,15 +117,18 @@ export function checkAlerts(postId) {
       if (open) {
         crisisId = open.id
         deduped = true
-        run('UPDATE crisis SET updated=?, last_trigger_at=? WHERE id=?', ts, tsMs, open.id)
+        run('UPDATE crisis SET last_trigger_at=? WHERE id=?', tsMs, open.id)
+        // 多规则并发/后续触发并入：更高级别规则上调事件级别（只升不降）
+        const escalate = (LV_RANK[al.level] || 0) > (LV_RANK[open.level] || 0)
+        if (escalate) run('UPDATE crisis SET level=? WHERE id=?', al.level, open.id)
         // 该规则是否已承接此事件：决定时间线语义
         const linked = q1('SELECT 1 FROM crisis_alerts WHERE crisis_id=? AND alert_id=?', open.id, al.id)
         attachRule(open.id, al.id, false, ts)
-        run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
-          open.id, linked ? '预警再次触发' : '规则归并',
-          linked
+        addTimeline(open.id, linked ? '预警再次触发' : '规则归并',
+          (linked
             ? `${detail} · 关联舆情《${p.title}》`
-            : `承接规则「${al.title}」（${LV_TEXT[al.level]}）：${detail} · 关联舆情《${p.title}》`, ts)
+            : `承接规则「${al.title}」（${LV_TEXT[al.level]}）：${detail} · 关联舆情《${p.title}》`) +
+          (escalate ? ` · 事件级别上调：${LV_TEXT[open.level]}→${LV_TEXT[al.level]}` : ''), ts)
       } else {
         const r = run('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,alert_id,origin,topic,last_trigger_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
           al.title, al.level, 'monitoring', '',
@@ -126,8 +136,7 @@ export function checkAlerts(postId) {
           ts, ts, '', al.keyword, al.id, 'auto', topic, tsMs)
         crisisId = Number(r.lastInsertRowid)
         attachRule(crisisId, al.id, true, ts)
-        run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
-          crisisId, '自动建档', `高等级预警触发：${detail}`, ts)
+        addTimeline(crisisId, '自动建档', `高等级预警触发：${detail}`, ts)
       }
     }
     const ev = run('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)',

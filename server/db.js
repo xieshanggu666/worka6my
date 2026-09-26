@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS alert_events (
   detail TEXT NOT NULL,
   time TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',  -- open/resolved（预警是否解除）
-  resolved TEXT                   -- 解除时间
+  resolved TEXT,                -- 解除时间
+  resolve_kind TEXT NOT NULL DEFAULT '' -- 解除途径：manual/batch/close（空=历史数据）
 );
 CREATE TABLE IF NOT EXISTS crisis (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +87,18 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   action TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
   time TEXT NOT NULL
+);
+-- 结案档案：每次结案一行，记录联动解除的预警清单与结案前状态，支撑结案回滚精确恢复
+CREATE TABLE IF NOT EXISTS crisis_closures (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  crisis_id INTEGER NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  resolved_events TEXT NOT NULL DEFAULT '[]',  -- 结案联动解除的 alert_event id 列表（JSON）
+  prev_status TEXT NOT NULL DEFAULT 'disposal', -- 结案前状态（回滚恢复目标）
+  closed_at TEXT NOT NULL,
+  rolled_back INTEGER NOT NULL DEFAULT 0,
+  rolled_back_at TEXT,
+  rollback_note TEXT NOT NULL DEFAULT ''
 );
 -- 可恢复批量导入：任务主表（幂等标识、状态机、进度、结果汇总）
 CREATE TABLE IF NOT EXISTS import_jobs (
@@ -121,7 +134,7 @@ CREATE TABLE IF NOT EXISTS import_job_items (
 );
 CREATE INDEX IF NOT EXISTS idx_import_job_items_job ON import_job_items (job_id, status);
 CREATE INDEX IF NOT EXISTS idx_import_job_items_key ON import_job_items (idem_key);
-CREATE INDEX IF NOT EXISTS idx_posts_idem_key ON posts (idem_key) WHERE idem_key IS NOT NULL;
+-- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
 `)
 
 // 把 toLocaleString('zh-CN') 形如「2026/9/26 01:54:38」解析为毫秒时间戳（迁移/窗口计算用）
@@ -142,6 +155,7 @@ function ensureColumn(table, col, ddl) {
 ensureColumn('alert_events', 'crisis_id', 'crisis_id INTEGER')
 ensureColumn('alert_events', 'status', "status TEXT NOT NULL DEFAULT 'open'")
 ensureColumn('alert_events', 'resolved', 'resolved TEXT')
+ensureColumn('alert_events', 'resolve_kind', "resolve_kind TEXT NOT NULL DEFAULT ''")
 ensureColumn('crisis', 'alert_id', 'alert_id INTEGER')
 ensureColumn('crisis', 'origin', "origin TEXT NOT NULL DEFAULT 'manual'")
 ensureColumn('alerts', 'merge_topic', "merge_topic TEXT NOT NULL DEFAULT ''")
@@ -221,6 +235,21 @@ function migrateLegacyLinks() {
 }
 migrateLegacyLinks()
 
+// 旧库迁移：为历史已结案事件补建结案档案（幂等：已有档案则跳过）。
+// 联动解除清单无法追溯置空——此类结案回滚时仅恢复事件状态，不回滚预警。
+function migrateClosures() {
+  const closed = db.prepare("SELECT id, updated FROM crisis WHERE status='closed'").all()
+  const hasClosure = db.prepare('SELECT 1 FROM crisis_closures WHERE crisis_id=? LIMIT 1')
+  const findNote = db.prepare("SELECT note, time FROM crisis_timeline WHERE crisis_id=? AND action='事件结案' ORDER BY id DESC LIMIT 1")
+  const ins = db.prepare('INSERT INTO crisis_closures (crisis_id,summary,resolved_events,prev_status,closed_at) VALUES (?,?,?,?,?)')
+  for (const c of closed) {
+    if (hasClosure.get(c.id)) continue
+    const tl = findNote.get(c.id)
+    ins.run(c.id, tl ? tl.note : '', '[]', 'disposal', tl ? tl.time : c.updated)
+  }
+}
+migrateClosures()
+
 function seed() {
   const n = db.prepare('SELECT COUNT(*) c FROM posts').get().c
   if (n > 0) return
@@ -296,14 +325,18 @@ function seed() {
   cl.run(c3, a3, 0, ago(2880), ago(2880))
 
   // 预警触发记录：c1/c2 由预警自动建档，c2 第二次触发去重并入；黄色规则不自动建档
-  const ae = db.prepare('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)')
-  ae.run(a1, 5, c1, '命中关键词「卫生」· 情感：negative · 热度90', ago(180), 'open', null)
-  ae.run(a2, 1, c2, '命中关键词「投诉」· 情感：negative · 热度82', ago(90), 'open', null)
-  ae.run(a2, 12, c2, '命中关键词「投诉」· 情感：negative · 热度74', ago(30), 'open', null)
-  ae.run(a3, 8, null, '命中关键词「延期」· 情感：negative · 热度78', ago(60), 'open', null)
-  // c3 人工建档但处置期承接了 a2/a3 两条规则，结案时已一并解除（历史闭环）
-  ae.run(a2, 11, c3, '命中关键词「投诉」· 情感：negative · 热度70', ago(4310), 'resolved', ago(2880))
-  ae.run(a3, 11, c3, '命中关键词「延期」· 情感：negative · 热度66', ago(2880), 'resolved', ago(2880))
+  const ae = db.prepare('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved,resolve_kind) VALUES (?,?,?,?,?,?,?,?)')
+  ae.run(a1, 5, c1, '命中关键词「卫生」· 情感：negative · 热度90', ago(180), 'open', null, '')
+  ae.run(a2, 1, c2, '命中关键词「投诉」· 情感：negative · 热度82', ago(90), 'open', null, '')
+  ae.run(a2, 12, c2, '命中关键词「投诉」· 情感：negative · 热度74', ago(30), 'open', null, '')
+  ae.run(a3, 8, null, '命中关键词「延期」· 情感：negative · 热度78', ago(60), 'open', null, '')
+  // c3 人工建档但处置期承接了 a2/a3 两条规则，结案前已逐条手动解除（历史闭环）
+  ae.run(a2, 11, c3, '命中关键词「投诉」· 情感：negative · 热度70', ago(4310), 'resolved', ago(2880), 'manual')
+  ae.run(a3, 11, c3, '命中关键词「延期」· 情感：negative · 热度66', ago(2880), 'resolved', ago(2880), 'manual')
+
+  // c3 结案档案（历史结案：预警先于结案手动解除，联动解除清单为空）
+  db.prepare('INSERT INTO crisis_closures (crisis_id,summary,resolved_events,prev_status,closed_at) VALUES (?,?,?,?,?)')
+    .run(c3, '舆情热度回落至常态区间，负面占比降至 5% 以下，完成处置闭环。', '[]', 'disposal', ago(2840))
 
   const ct = db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
   ;[['自动建档', '高等级预警触发：命中关键词「卫生」· 情感：negative · 热度90', ago(180)],

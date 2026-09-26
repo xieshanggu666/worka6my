@@ -2,7 +2,7 @@
   <div class="crisis">
     <div class="toolbar">
       <button class="add" @click="showForm=!showForm">＋ 新建危机事件</button>
-      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：同规则不同话题/超窗分别建档，同一事件可承接多条规则；预警解除与结案自动同步时间线</span>
+      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：多规则并发触发可承接同一事件并上调级别；解除幂等、结案可回滚，全程统一时间线</span>
     </div>
 
     <form v-if="showForm" class="c-form" @submit.prevent="create">
@@ -94,10 +94,20 @@
                 <b>{{ e.detail }}</b>
                 <span v-if="e.pt">关联舆情《{{ e.pt }}》 · 热度{{ e.heat }}</span>
               </div>
+              <em v-if="e.status==='resolved' && e.resolve_kind" class="rv-kind">{{ kindText(e.resolve_kind) }}</em>
               <span class="rv-st" :class="e.status">{{ e.status==='resolved' ? '已解除' : '待处置' }}</span>
             </div>
           </div>
           <div v-else class="rv-none">无关联预警触发记录（人工建档）</div>
+
+          <!-- 结案档案：结案/回滚历史（统一时间线口径） -->
+          <div v-if="review.closures && review.closures.length" class="rv-closures">
+            <div v-for="cl in review.closures" :key="cl.id" class="rv-closure" :class="{rolled: cl.rolled_back}">
+              <b>{{ cl.rolled_back ? '↩︎ 结案已回滚' : '✔ 结案' }}</b>
+              <span class="cl-sum">{{ cl.summary || '（无总结）' }}</span>
+              <em>{{ cl.closed_at }}<template v-if="cl.rolled_back"> · 回滚于 {{ cl.rolled_back_at }}{{ cl.rollback_note ? '：' + cl.rollback_note : '' }}</template></em>
+            </div>
+          </div>
 
           <div v-if="c.status!=='closed'" class="close-box">
             <textarea v-model="closeSummary" placeholder="结案回溯总结：处置结果、舆情回落情况、经验沉淀…"></textarea>
@@ -114,6 +124,7 @@
           <button v-if="c.status==='monitoring'||c.status==='disposal'" class="prog" @click="advance(c)">推进处置</button>
           <button class="ghost" @click="toggleReview(c)">{{ reviewId===c.id ? '收起回溯' : '🔍 回溯' }}</button>
           <button v-if="c.status!=='closed'" class="close" @click="toggleReview(c, true)">结案</button>
+          <button v-else class="reopen" @click="reopen(c)">↩︎ 回滚结案</button>
         </div>
       </div>
     </div>
@@ -160,6 +171,13 @@ async function confirmClose(c) {
   reviewId.value = null
   review.value = null
 }
+async function reopen(c) {
+  const note = prompt(`回滚结案「${c.title}」：结案时联动解除的预警将恢复为未解除，事件重回处置流程。\n回滚说明（可留空）：`)
+  if (note == null) return
+  await store.reopenCrisis(c.id, note)
+  if (reviewId.value === c.id) review.value = await store.fetchCrisisReview(c.id) // 刷新回溯（结案档案/未解除计数）
+}
+function kindText(k) { return { manual: '手动解除', batch: '批量解除', close: '结案联动' }[k] || k }
 async function del(c) {
   if (confirm(`删除危机「${c.title}」？`)) await store.delCrisis(c.id)
 }
@@ -238,6 +256,12 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .rv-st{font-size:10px;padding:1px 7px;border-radius:5px;flex:none;}
 .rv-st.open{background:#3e2723;color:#ffab91;}
 .rv-st.resolved{background:#1b5e20;color:#a5d6a7;}
+.rv-kind{font-size:9px;font-style:normal;color:#90caf9;background:#0d2137;border:1px solid rgba(144,202,249,.25);border-radius:4px;padding:1px 5px;flex:none;margin-top:2px;}
+.rv-closures{display:flex;flex-direction:column;gap:5px;margin-bottom:10px;}
+.rv-closure{background:#13233f;border-radius:7px;padding:6px 9px;font-size:11px;color:#dbe4f3;display:flex;flex-direction:column;gap:2px;border-left:3px solid #66bb6a;}
+.rv-closure.rolled{border-left-color:#ffb300;opacity:.85;}
+.rv-closure .cl-sum{color:#8ba2c8;font-size:10px;}
+.rv-closure em{color:#5b6f94;font-size:10px;font-style:normal;}
 .rv-none{color:#5b6f94;font-size:11px;text-align:center;padding:8px 0;}
 .close-box{border-top:1px dashed rgba(120,160,220,0.15);padding-top:10px;display:flex;flex-direction:column;gap:8px;}
 .close-box textarea{min-height:56px;}
@@ -247,5 +271,6 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
 .prog{background:linear-gradient(135deg,#ef6c00,#e65100);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .close{background:linear-gradient(135deg,#2e7d32,#1b5e20);border:none;color:#fff;font-weight:600;cursor:pointer;}
+.reopen{background:linear-gradient(135deg,#f9a825,#f57f17);border:none;color:#fff;font-weight:600;cursor:pointer;}
 .none{color:#5b6f94;text-align:center;padding:40px;}
 </style>

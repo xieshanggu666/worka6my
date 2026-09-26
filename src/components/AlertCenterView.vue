@@ -34,11 +34,33 @@
             <span v-if="openCount(a.id)" class="open-tag">🔔 未解除 {{ openCount(a.id) }}</span>
             <div class="r-btns">
               <button v-if="openCount(a.id)" class="resolve" @click="resolveAll(a)">全部解除</button>
+              <button class="edit" @click="startEdit(a)">{{ editingId===a.id ? '收起' : '编辑' }}</button>
               <label class="switch">
                 <input type="checkbox" :checked="!!a.active" @change="store.toggleAlert(a.id)" />
                 <span></span>
               </label>
               <button class="del" @click="store.deleteAlert(a.id)">删除</button>
+            </div>
+            <!-- 规则编辑：归并话题/时间窗口变更即时作用于后续触发，并写入关联未结案事件时间线 -->
+            <div v-if="editingId===a.id" class="edit-form">
+              <input v-model="editForm.title" placeholder="规则名称" />
+              <div class="row">
+                <select v-model="editForm.level"><option value="red">红色</option><option value="orange">橙色</option><option value="yellow">黄色</option></select>
+                <input v-model="editForm.keyword" placeholder="关键词（留空=全部）" />
+              </div>
+              <div class="row">
+                <select v-model="editForm.sentiment"><option value="">不限情感</option><option value="negative">负面</option><option value="positive">正面</option><option value="neutral">中性</option></select>
+                <input v-model.number="editForm.heat_min" type="number" placeholder="热度下限" />
+              </div>
+              <div class="row">
+                <input v-model="editForm.merge_topic" placeholder="归并话题（留空=取舆情话题）" />
+                <input v-model.number="editForm.merge_window" type="number" min="0" placeholder="时间窗口(分,0不限)" />
+              </div>
+              <div class="row">
+                <button class="save" @click="saveEdit">保存修改</button>
+                <button class="ghost" @click="editingId=null">取消</button>
+              </div>
+              <p class="hint">💡 话题/时间窗口变更即时作用于后续触发归并，并写入关联未结案事件的时间线；历史归并保持不变。</p>
             </div>
           </div>
         </div>
@@ -74,16 +96,33 @@ import { usePubStore } from '@/store/pub'
 const store = usePubStore()
 const alertList = ref([])
 const events = ref([])
+const openCounts = ref({}) // 服务端按规则聚合的未解除计数（不受触发记录 60 条窗口限制）
 const form = ref({ title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60, merge_topic: '', merge_window: 0 })
+const editingId = ref(null)
+const editForm = ref({})
 
 async function load() {
   const d = await store.fetchAlerts()
   alertList.value = d.alerts
   events.value = d.events
+  openCounts.value = d.openCounts || {}
 }
 function add() {
   store.saveAlert(form.value)
   form.value = { title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60, merge_topic: '', merge_window: 0 }
+  load()
+}
+function startEdit(a) {
+  if (editingId.value === a.id) { editingId.value = null; return }
+  editingId.value = a.id
+  editForm.value = {
+    title: a.title, level: a.level, keyword: a.keyword, sentiment: a.sentiment,
+    heat_min: a.heat_min, merge_topic: a.merge_topic, merge_window: a.merge_window
+  }
+}
+async function saveEdit() {
+  await store.updateAlert(editingId.value, { ...editForm.value })
+  editingId.value = null
   load()
 }
 function eLevel(alertId) {
@@ -91,7 +130,7 @@ function eLevel(alertId) {
   return a ? a.level : ''
 }
 function openCount(alertId) {
-  return events.value.filter((e) => e.alert_id === alertId && e.status !== 'resolved').length
+  return openCounts.value[alertId] || 0
 }
 async function resolveOne(e) {
   const note = prompt('解除说明（可留空）：', '风险指标回落，预警解除')
@@ -130,6 +169,11 @@ input,select,button{font-family:inherit;background:#0f1b38;border:1px solid rgba
 .open-tag{font-size:10px;color:#ffab91;background:#3e2723;border:1px solid rgba(255,138,101,.3);border-radius:5px;padding:1px 6px;margin-left:6px;}
 .hint{margin:0;font-size:10px;color:#5b6f94;line-height:1.5;}
 .resolve{background:none;border:1px solid rgba(102,187,106,.45);color:#81c784;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;}
+.edit{background:none;border:1px solid rgba(144,202,249,.4);color:#90caf9;cursor:pointer;border-radius:7px;padding:4px 9px;font-size:11px;}
+.edit-form{margin-top:8px;background:#0f1b38;border:1px solid rgba(120,160,220,0.18);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px;}
+.edit-form .hint{margin:0;font-size:10px;color:#5b6f94;line-height:1.5;}
+.edit-form .save{cursor:pointer;}
+.edit-form .ghost{background:#16263f;color:#8ba2c8;cursor:pointer;border:1px solid rgba(120,160,220,0.2);border-radius:8px;}
 .r-btns{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:6px;}
 .switch{position:relative;width:36px;height:20px;display:inline-block;}
 .switch input{opacity:0;width:0;height:0;}

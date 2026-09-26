@@ -47,12 +47,14 @@ export const usePubStore = defineStore('pub', {
     async resumeImport(id) { return await api(`/imports/${id}/resume`, 'POST') },
     async fetchAlerts() { return await api('/alerts') },
     async saveAlert(a) { await api('/alerts', 'POST', a); await this.load(); this.msg('预警规则已保存', 'success') },
+    async updateAlert(id, a) { await api(`/alerts/${id}`, 'PUT', a); await this.load(); this.msg('预警规则已更新，归并参数即时生效', 'success') },
     async toggleAlert(id) { await api(`/alerts/${id}/toggle`, 'POST'); await this.load() },
     async deleteAlert(id) { await api('/alerts/' + id, 'DELETE'); await this.load() },
     async resolveAlertEvent(id, note) {
       const r = await api(`/alert-events/${id}/resolve`, 'POST', { note })
       await this.load()
-      this.msg(r.crisisId ? `预警已解除，已同步危机 #${r.crisisId} 时间线` : '预警已解除', 'success')
+      if (r.already) this.msg('该预警已是解除状态，重复解除已忽略', 'info')
+      else this.msg(r.crisisId ? `预警已解除，已同步危机 #${r.crisisId} 时间线` : '预警已解除', 'success')
       return r
     },
     async resolveAlert(id, note) {
@@ -72,7 +74,15 @@ export const usePubStore = defineStore('pub', {
     async closeCrisis(id, summary) {
       const r = await api(`/crisis/${id}/close`, 'POST', { summary })
       await this.load()
-      this.msg(r.resolved ? `事件已结案，同步解除 ${r.resolved} 条预警` : '事件已结案', 'success')
+      if (r.already) this.msg('事件已处于结案状态', 'info')
+      else this.msg(r.resolved ? `事件已结案，同步解除 ${r.resolved} 条预警` : '事件已结案', 'success')
+      return r
+    },
+    async reopenCrisis(id, note) {
+      const r = await api(`/crisis/${id}/reopen`, 'POST', { note })
+      await this.load()
+      if (r.already) this.msg('事件未在结案状态，无需回滚', 'info')
+      else this.msg(r.restored ? `已回滚结案，恢复 ${r.restored} 条未解除预警` : '已回滚结案，事件重新打开', 'success')
       return r
     },
     async delCrisis(id) { await api('/crisis/' + id, 'DELETE'); await this.load() }
